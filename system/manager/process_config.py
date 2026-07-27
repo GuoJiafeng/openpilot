@@ -71,6 +71,9 @@ def use_github_runner(started, params, CP: car.CarParams) -> bool:
 def use_copyparty(started, params, CP: car.CarParams) -> bool:
   return bool(params.get_bool("EnableCopyparty"))
 
+def use_c3_web(started, params, CP: car.CarParams) -> bool:
+  return bool(params.get_bool("EnableC3Web"))
+
 def sunnylink_ready_shim(started, params, CP: car.CarParams) -> bool:
   """Shim for sunnylink_ready to match the process manager signature."""
   return sunnylink_ready(params)
@@ -155,6 +158,7 @@ procs = [
   PythonProcess("beep", "selfdrive.selfdrived.beep", always_run),
   PythonProcess("feedbackd", "selfdrive.ui.feedback.feedbackd", only_onroad),
   PythonProcess("c3-client", "selfdrive.c3_client", always_run),
+  PythonProcess("c3_webd", "selfdrive.c3_web.c3_webd", use_c3_web),
 
   # debug procs
   NativeProcess("bridge", "cereal/messaging", ["./bridge"], notcar),
