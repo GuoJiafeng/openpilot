@@ -584,7 +584,7 @@
 
     var html = '';
     opts.forEach(function (opt) {
-      var id = get(opt, 'id', '');
+      var id = get(opt, 'preset', '');
       var label = get(opt, 'label', id);
       var detail = qualityDetailText(opt);
       var isActive = id === state.qualitySelected;
@@ -702,7 +702,7 @@
   /** Get human label for a quality id */
   function qualityLabelForId(id) {
     for (var i = 0; i < state.qualityOptions.length; i++) {
-      if (get(state.qualityOptions[i], 'id', '') === id) return get(state.qualityOptions[i], 'label', id);
+      if (get(state.qualityOptions[i], 'preset', '') === id) return get(state.qualityOptions[i], 'label', id);
     }
     return id;
   }
