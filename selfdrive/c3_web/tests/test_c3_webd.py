@@ -8,11 +8,11 @@ from openpilot.selfdrive.c3_web.c3_webd import DriverViewLease, FrameBroadcaster
 
 
 class FakeParams:
-  def __init__(self, offroad=True, driver=False): self.values = {"IsOffroad": offroad, "IsDriverViewEnabled": driver, "C3WebLiveQuality": 1}
+  def __init__(self, offroad=True, driver=False): self.values = {"IsOffroad": offroad, "IsDriverViewEnabled": driver, "C3WebLiveQuality": b"1"}
+  def get(self, key): return self.values.get(key)
   def get_bool(self, key): return self.values.get(key, False)
+  def put(self, key, value): self.values[key] = value.encode() if isinstance(value, str) else value
   def put_bool(self, key, value): self.values[key] = value
-  def get_int(self, key): return self.values.get(key, 0)
-  def put_int(self, key, value): self.values[key] = value
 
 
 def test_route_listing_and_final_segment_split(tmp_path):
@@ -98,10 +98,10 @@ def test_live_quality_presets_persist_and_env_overrides():
   params = FakeParams()
   response = live_config_response(params)
   assert response["selected"] == "high" and [option["preset"] for option in response["options"]] == ["smooth", "high", "ultra"]
-  params.put_int("C3WebLiveQuality", 0)
+  params.put("C3WebLiveQuality", "0")
   assert live_config(params) == {"selected": "smooth", "width": 640, "height": 480, "qscale": 3}
   smooth_encoder = JpegEncoder(live_config(params))
-  params.put_int("C3WebLiveQuality", 2)
+  params.put("C3WebLiveQuality", "2")
   ultra_encoder = JpegEncoder(live_config(params))
   assert smooth_encoder.max_size == (640, 480) and ultra_encoder.max_size == (1280, 960)
   old = {key: os.environ.get(key) for key in ("C3_WEB_MAX_WIDTH", "C3_WEB_MAX_HEIGHT", "C3_WEB_JPEG_QSCALE")}
@@ -122,7 +122,7 @@ def test_live_quality_post_rejects_active_and_persists_selection():
     params = FakeParams(); app = {"params": params, "broadcasters": {}}
     assert b'"selected": "high"' in (await live_config_get(type("Request", (), {"app": app})())).body
     response = await live_config_post(Request(app, "smooth"))
-    assert params.get_int("C3WebLiveQuality") == 0 and b'"selected": "smooth"' in response.body
+    assert int(params.get("C3WebLiveQuality")) == 0 and b'"selected": "smooth"' in response.body
     app["broadcasters"] = {"road": type("Broadcaster", (), {"has_clients": True})()}
     try: await live_config_post(Request(app, "ultra"))
     except web.HTTPConflict: pass

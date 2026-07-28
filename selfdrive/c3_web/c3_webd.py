@@ -205,7 +205,9 @@ def jpeg_pillow_quality(qscale=None):
   return max(25, min(95, 100 - 5 * jpeg_qscale(qscale)))
 
 def live_preset(params):
-  try: index = int(params.get_int("C3WebLiveQuality"))
+  try:
+    raw = params.get("C3WebLiveQuality")
+    index = 1 if raw is None else int(raw.decode("utf-8"))
   except (AttributeError, TypeError, ValueError): index = 1
   return LIVE_PRESETS[index] if 0 <= index < len(LIVE_PRESETS) else LIVE_PRESETS[1]
 
@@ -448,7 +450,7 @@ async def live_config_post(request):
   options = {option["preset"]: index for index, option in enumerate(LIVE_PRESETS)}
   if preset not in options: raise web.HTTPBadRequest(text="invalid preset")
   if any(bc.has_clients for bc in request.app["broadcasters"].values()): raise web.HTTPConflict(text="disconnect live streams first")
-  request.app["params"].put_int("C3WebLiveQuality", options[preset])
+  request.app["params"].put("C3WebLiveQuality", str(options[preset]))
   return web.json_response(live_config_response(request.app["params"]))
 
 async def routes_response(request):
