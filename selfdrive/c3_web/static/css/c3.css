@@ -1037,6 +1037,175 @@ img { display: block; max-width: 100%; }
 }
 
 /* ============================================================
+   PIN Authentication Overlay
+   ============================================================ */
+.c3-pin-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(8, 10, 15, 0.85);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  animation: pin-overlay-in 0.25s ease;
+}
+
+@keyframes pin-overlay-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+.c3-pin-overlay--leaving {
+  animation: pin-overlay-out 0.3s ease forwards;
+}
+
+@keyframes pin-overlay-out {
+  from { opacity: 1; }
+  to   { opacity: 0; }
+}
+
+.c3-pin {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--s5);
+  padding: var(--s6) var(--s5);
+  max-width: 320px;
+  width: 100%;
+}
+
+.c3-pin__header {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--s2);
+  text-align: center;
+}
+
+.c3-pin__logo {
+  width: 40px;
+  height: 40px;
+  color: var(--accent);
+}
+
+.c3-pin__title {
+  font-size: 1.125rem;
+  font-weight: 700;
+  color: var(--fg-bright);
+  letter-spacing: 0.04em;
+}
+
+.c3-pin__subtitle {
+  font-size: 0.8125rem;
+  color: var(--fg-dim);
+}
+
+/* Dot display */
+.c3-pin__dots {
+  display: flex;
+  gap: var(--s3);
+  justify-content: center;
+  padding: var(--s3) 0;
+}
+
+.c3-pin__dot {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid var(--fg-muted);
+  background: transparent;
+  transition: background var(--t-fast), border-color var(--t-fast);
+}
+
+.c3-pin__dot--filled {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+/* Shake on wrong PIN */
+.c3-pin__dots--shake {
+  animation: pin-shake 0.4s ease;
+}
+
+@keyframes pin-shake {
+  0%, 100% { transform: translateX(0); }
+  20%      { transform: translateX(-8px); }
+  40%      { transform: translateX(8px); }
+  60%      { transform: translateX(-6px); }
+  80%      { transform: translateX(6px); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .c3-pin__dots--shake {
+    animation-duration: 0.01ms;
+  }
+}
+
+/* Error text */
+.c3-pin__error {
+  min-height: 1.2em;
+  font-size: 0.75rem;
+  color: var(--err);
+  text-align: center;
+  line-height: 1.2;
+}
+
+/* Number pad */
+.c3-pin__pad {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: var(--s2);
+  width: 100%;
+  max-width: 260px;
+}
+
+.c3-pin__key {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 52px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--bg-2);
+  color: var(--fg-bright);
+  font-size: 1.25rem;
+  font-weight: 600;
+  font-family: var(--font-body);
+  cursor: pointer;
+  transition: background var(--t-fast), color var(--t-fast);
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+}
+
+.c3-pin__key:hover:not(.c3-pin__key--blank):not(:disabled) {
+  background: var(--bg-hover);
+}
+
+.c3-pin__key:active:not(.c3-pin__key--blank):not(:disabled) {
+  background: var(--accent-dim);
+  color: #fff;
+}
+
+.c3-pin__key--blank {
+  background: transparent;
+  border-color: transparent;
+  cursor: default;
+  pointer-events: none;
+}
+
+.c3-pin__key--fn {
+  font-size: 1.1rem;
+  color: var(--fg-dim);
+}
+
+.c3-pin__key:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+
+/* ============================================================
    Utility
    ============================================================ */
 .c3-sr-only {

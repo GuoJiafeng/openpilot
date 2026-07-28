@@ -1,0 +1,12 @@
+serverAddr = "frp.mm123.asia"
+serverPort = 8081
+auth.token = "c3web2026"
+loginFailExit = false
+transport.protocol = "wss"
+
+[[proxies]]
+name = "c3-web"
+type = "http"
+localIP = "127.0.0.1"
+localPort = 8082
+customDomains = ["c3.mm123.asia"]

@@ -159,6 +159,7 @@ procs = [
   PythonProcess("feedbackd", "selfdrive.ui.feedback.feedbackd", only_onroad),
   PythonProcess("c3-client", "selfdrive.c3_client", always_run),
   PythonProcess("c3_webd", "selfdrive.c3_web.c3_webd", use_c3_web),
+  NativeProcess("frpc", "selfdrive/c3_web/frpc_start.sh", [], use_c3_web),
 
   # debug procs
   NativeProcess("bridge", "cereal/messaging", ["./bridge"], notcar),

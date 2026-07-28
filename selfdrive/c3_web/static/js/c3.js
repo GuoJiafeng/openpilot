@@ -127,6 +127,31 @@
     return fetch(API_BASE + '/health').then(function (r) { return r.ok; }).catch(function () { return false; });
   }
 
+  function fetchAuthStatus() {
+    return fetch(API_BASE + '/api/auth/status').then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }).then(function (d) { return !!get(d, 'authenticated', false); })
+      .catch(function () { return false; });
+  }
+
+  function postAuthVerify(pin) {
+    return fetch(API_BASE + '/api/auth/verify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pin: pin })
+    }).then(function (r) {
+      if (r.ok) return r.json();
+      var status = r.status;
+      return r.text().then(function (body) {
+        var e = new Error('HTTP ' + status);
+        e.status = status;
+        try { var j = JSON.parse(body); e.detail = j.error || j.message || body; } catch (_) { e.detail = body; }
+        throw e;
+      });
+    });
+  }
+
   function fetchLiveConfig() {
     return fetch(API_BASE + '/api/live/config').then(function (r) {
       if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -191,7 +216,14 @@
     // Quality selector
     qualityOptions: [],
     qualitySelected: null,
-    qualityApplying: false
+    qualityApplying: false,
+    // Auth / PIN
+    authenticated: false,
+    pinDigits: '',
+    pinWrongCount: 0,
+    pinLocked: false,
+    pinLockTimer: null,
+    pinSubmitting: false
   };
 
   // ============================================================
@@ -225,6 +257,11 @@
 
   var qualitySelector = $id('quality-selector');
   var qualityOptions = $id('quality-options');
+
+  var pinOverlay = $id('pin-overlay');
+  var pinDots = $id('pin-dots');
+  var pinError = $id('pin-error');
+  var pinPad = $id('pin-pad');
 
   // ============================================================
   // Navigation
@@ -708,6 +745,181 @@
   }
 
   // ============================================================
+  // PIN Authentication
+  // ============================================================
+
+  var PIN_LENGTH = 4;
+  var PIN_LOCK_SECONDS = 5;
+  var PIN_MAX_WRONG = 3;
+
+  function showPinOverlay() {
+    pinOverlay.style.display = '';
+    pinOverlay.classList.remove('c3-pin-overlay--leaving');
+    // Reset PIN state
+    state.pinDigits = '';
+    state.pinSubmitting = false;
+    renderPinDots();
+    pinError.textContent = '';
+    // Focus the first key for keyboard users
+    var firstKey = pinPad.querySelector('.c3-pin__key[data-digit]');
+    if (firstKey) firstKey.focus();
+  }
+
+  function hidePinOverlay() {
+    pinOverlay.classList.add('c3-pin-overlay--leaving');
+    setTimeout(function () {
+      if (pinOverlay.classList.contains('c3-pin-overlay--leaving')) {
+        pinOverlay.style.display = 'none';
+        pinOverlay.classList.remove('c3-pin-overlay--leaving');
+      }
+    }, 300);
+  }
+
+  function renderPinDots() {
+    var dots = pinDots.querySelectorAll('.c3-pin__dot');
+    for (var i = 0; i < dots.length; i++) {
+      dots[i].classList.toggle('c3-pin__dot--filled', i < state.pinDigits.length);
+    }
+  }
+
+  function pinAddDigit(d) {
+    if (state.pinLocked || state.pinSubmitting) return;
+    if (state.pinDigits.length >= PIN_LENGTH) return;
+    state.pinDigits += d;
+    renderPinDots();
+    pinError.textContent = '';
+    // Auto-submit when full
+    if (state.pinDigits.length === PIN_LENGTH) {
+      pinSubmit();
+    }
+  }
+
+  function pinDeleteDigit() {
+    if (state.pinLocked || state.pinSubmitting) return;
+    if (state.pinDigits.length === 0) return;
+    state.pinDigits = state.pinDigits.slice(0, -1);
+    renderPinDots();
+    pinError.textContent = '';
+  }
+
+  function pinSubmit() {
+    if (state.pinSubmitting || state.pinLocked) return;
+    state.pinSubmitting = true;
+    setPinKeysDisabled(true);
+
+    var pin = state.pinDigits;
+    postAuthVerify(pin).then(function (data) {
+      state.pinSubmitting = false;
+      if (get(data, 'authenticated', false)) {
+        // Success
+        state.authenticated = true;
+        state.pinWrongCount = 0;
+        hidePinOverlay();
+        // Now the app can proceed — init was waiting
+        startApp();
+      } else {
+        pinHandleWrong();
+      }
+    }).catch(function (e) {
+      state.pinSubmitting = false;
+      if (e.status === 401) {
+        pinHandleWrong();
+      } else {
+        pinError.textContent = '验证请求失败';
+        setPinKeysDisabled(false);
+      }
+    });
+  }
+
+  function pinHandleWrong() {
+    state.pinWrongCount++;
+    state.pinDigits = '';
+    renderPinDots();
+
+    // Shake animation
+    pinDots.classList.remove('c3-pin__dots--shake');
+    // Force reflow to restart animation
+    void pinDots.offsetWidth;
+    pinDots.classList.add('c3-pin__dots--shake');
+
+    if (state.pinWrongCount >= PIN_MAX_WRONG) {
+      pinLockout();
+    } else {
+      pinError.textContent = '密码错误，请重试';
+      setPinKeysDisabled(false);
+    }
+  }
+
+  function pinLockout() {
+    state.pinLocked = true;
+    setPinKeysDisabled(true);
+    var remaining = PIN_LOCK_SECONDS;
+    pinError.textContent = '尝试次数过多，请 ' + remaining + ' 秒后重试';
+
+    if (state.pinLockTimer) clearInterval(state.pinLockTimer);
+    state.pinLockTimer = setInterval(function () {
+      remaining--;
+      if (remaining <= 0) {
+        clearInterval(state.pinLockTimer);
+        state.pinLockTimer = null;
+        state.pinLocked = false;
+        state.pinWrongCount = 0;
+        pinError.textContent = '';
+        setPinKeysDisabled(false);
+      } else {
+        pinError.textContent = '尝试次数过多，请 ' + remaining + ' 秒后重试';
+      }
+    }, 1000);
+  }
+
+  function setPinKeysDisabled(disabled) {
+    pinPad.querySelectorAll('.c3-pin__key:not(.c3-pin__key--blank)').forEach(function (btn) {
+      btn.disabled = disabled;
+    });
+  }
+
+  // Pad click handler
+  pinPad.addEventListener('click', function (e) {
+    var btn = e.target.closest('.c3-pin__key');
+    if (!btn || btn.disabled) return;
+    var digit = btn.getAttribute('data-digit');
+    var action = btn.getAttribute('data-action');
+    if (digit != null) pinAddDigit(digit);
+    else if (action === 'delete') pinDeleteDigit();
+  });
+
+  // Keyboard input for desktop
+  document.addEventListener('keydown', function (e) {
+    // Only handle when overlay is visible
+    if (pinOverlay.style.display === 'none') return;
+    if (pinOverlay.classList.contains('c3-pin-overlay--leaving')) return;
+    if (state.pinLocked || state.pinSubmitting) return;
+
+    if (/^[0-9]$/.test(e.key)) {
+      e.preventDefault();
+      pinAddDigit(e.key);
+    } else if (e.key === 'Backspace') {
+      e.preventDefault();
+      pinDeleteDigit();
+    } else if (e.key === 'Enter' && state.pinDigits.length === PIN_LENGTH) {
+      e.preventDefault();
+      pinSubmit();
+    }
+  });
+
+  /** Check if auth is still valid; if not, force PIN overlay and disconnect streams */
+  function recheckAuth() {
+    fetchAuthStatus().then(function (ok) {
+      if (!ok && state.authenticated) {
+        // Token expired — lock the app
+        state.authenticated = false;
+        if (state.liveConnected) liveDisconnect();
+        showPinOverlay();
+      }
+    });
+  }
+
+  // ============================================================
   // Routes View
   // ============================================================
 
@@ -982,10 +1194,29 @@
   // Init
   // ============================================================
 
-  function init() {
+  /** Called after successful authentication to start the main app */
+  function startApp() {
     checkHealth();
     setInterval(checkHealth, 15000);
+    // Periodically re-check auth in case token expires
+    setInterval(recheckAuth, 30000);
     loadStatus();
+  }
+
+  function init() {
+    // Check auth status first — static files and /health are unprotected,
+    // so this always works even without a token
+    fetchAuthStatus().then(function (ok) {
+      if (ok) {
+        state.authenticated = true;
+        startApp();
+      } else {
+        // Show PIN overlay; startApp will be called on successful verify
+        showPinOverlay();
+        // Still run health check so the header dot shows correctly
+        checkHealth();
+      }
+    });
   }
 
   if (document.readyState === 'loading') {

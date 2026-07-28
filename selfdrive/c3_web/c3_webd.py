@@ -5,6 +5,7 @@ import hashlib
 import io
 import os
 import re
+import secrets
 import tempfile
 import threading
 import time
@@ -493,7 +494,42 @@ def create_app(roots=None, params=None, preview_dir=None):
     params = Params()
   preview_dir = Path(preview_dir or Path(tempfile.gettempdir()) / "c3-web-preview"); preview_dir.mkdir(parents=True, exist_ok=True)
   app = web.Application(); app["store"] = RouteStore(roots); app["params"] = params; app["lease"] = DriverViewLease(params, float(os.getenv("C3_WEB_DRIVER_GRACE", "2"))); app["preview_dir"] = preview_dir; app["preview_semaphore"] = asyncio.Semaphore(max(1, int(os.getenv("C3_WEB_PREVIEW_JOBS", "2")))); app["broadcasters"] = {}; app["encoder_factory"] = lambda: JpegEncoder(live_config(params))
+  app["sessions"] = {}  # token -> expiry_time
+
+  @web.middleware
+  async def auth_middleware(request, handler):
+    if request.path == "/health" or request.path.startswith("/api/auth/"):
+      return await handler(request)
+    if not request.path.startswith("/api/"):
+      return await handler(request)  # static files pass through
+    token = request.cookies.get("c3_token")
+    if token and token in request.app["sessions"] and time.time() < request.app["sessions"][token]:
+      return await handler(request)
+    return web.json_response({"error": "unauthorized"}, status=401)
+
+  app.middlewares.append(auth_middleware)
+
+  async def auth_verify(request):
+    try: body = await request.json()
+    except Exception: return web.json_response({"error": "invalid"}, status=400)
+    pin = body.get("pin", "")
+    try: correct = params.get("C3WebPin"); correct = correct.decode("utf-8") if isinstance(correct, bytes) else correct
+    except Exception: correct = "0909"
+    if not correct or str(pin) != str(correct):
+      return web.json_response({"error": "wrong pin"}, status=401)
+    token = secrets.token_hex(32); expiry = time.time() + 86400  # 24h
+    request.app["sessions"][token] = expiry
+    resp = web.json_response({"authenticated": True})
+    resp.set_cookie("c3_token", token, max_age=86400, httponly=True, samesite="Lax")
+    return resp
+
+  async def auth_status(request):
+    token = request.cookies.get("c3_token")
+    ok = token is not None and token in request.app["sessions"] and time.time() < request.app["sessions"][token]
+    return web.json_response({"authenticated": ok})
+
   app.router.add_get("/health", health_response)
+  app.router.add_post("/api/auth/verify", auth_verify); app.router.add_get("/api/auth/status", auth_status)
   app.router.add_get("/api/status", status_response)
   app.router.add_get("/api/live/config", live_config_get); app.router.add_post("/api/live/config", live_config_post)
   app.router.add_get("/api/routes", routes_response); app.router.add_get("/api/routes/{route}", route_response)
