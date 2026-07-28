@@ -187,6 +187,11 @@
   var camDriverIndicator = $id('cam-driver-indicator');
   var camDriverStatus = $id('cam-driver-status');
 
+  var camWideRoadImg = $id('cam-wide-road-img');
+  var camWideRoadPlaceholder = $id('cam-wide-road-placeholder');
+  var camWideRoadIndicator = $id('cam-wide-road-indicator');
+  var camWideRoadStatus = $id('cam-wide-road-status');
+
   var btnConnect = $id('btn-live-connect');
   var btnDisconnect = $id('btn-live-disconnect');
 
@@ -470,6 +475,22 @@
       camDriverStatus.style.color = 'var(--err)';
     };
     camDriverImg.src = API_BASE + '/api/live/driver';
+
+    // Wide road
+    camWideRoadPlaceholder.style.display = 'none';
+    camWideRoadImg.classList.add('c3-cam__img--visible');
+    camWideRoadIndicator.classList.add('c3-cam__indicator--live');
+    camWideRoadStatus.textContent = '连接中';
+    camWideRoadStatus.style.color = 'var(--warn)';
+    camWideRoadImg.onload = function () {
+      camWideRoadStatus.textContent = '接收中';
+      camWideRoadStatus.style.color = 'var(--ok)';
+    };
+    camWideRoadImg.onerror = function () {
+      camWideRoadStatus.textContent = '信号丢失';
+      camWideRoadStatus.style.color = 'var(--err)';
+    };
+    camWideRoadImg.src = API_BASE + '/api/live/wide_road';
   }
 
   function liveDisconnect() {
@@ -498,6 +519,16 @@
     camDriverPlaceholder.style.display = '';
     camDriverIndicator.classList.remove('c3-cam__indicator--live');
     camDriverStatus.textContent = '';
+
+    // Wide road
+    camWideRoadImg.onload = null;
+    camWideRoadImg.onerror = null;
+    camWideRoadImg.classList.remove('c3-cam__img--visible');
+    camWideRoadImg.removeAttribute('src');
+    camWideRoadImg.src = '';
+    camWideRoadPlaceholder.style.display = '';
+    camWideRoadIndicator.classList.remove('c3-cam__indicator--live');
+    camWideRoadStatus.textContent = '';
   }
 
   btnConnect.addEventListener('click', liveConnect);
@@ -771,10 +802,12 @@
       // Clear src to stop the MJPEG fetch
       camRoadImg.removeAttribute('src');
       camDriverImg.removeAttribute('src');
+      camWideRoadImg.removeAttribute('src');
     } else if (!document.hidden && state.liveConnected) {
       // Reconnect
       camRoadImg.src = API_BASE + '/api/live/road';
       camDriverImg.src = API_BASE + '/api/live/driver';
+      camWideRoadImg.src = API_BASE + '/api/live/wide_road';
     }
   });
 

@@ -92,7 +92,7 @@ async def leased_live_client(lease, factory, timeout):
 
 def vision_client_factory(camera):
   from msgq.visionipc import VisionIpcClient, VisionStreamType
-  stream = {"road": VisionStreamType.VISION_STREAM_ROAD, "driver": VisionStreamType.VISION_STREAM_DRIVER}.get(camera)
+  stream = {"road": VisionStreamType.VISION_STREAM_ROAD, "driver": VisionStreamType.VISION_STREAM_DRIVER, "wide_road": VisionStreamType.VISION_STREAM_WIDE_ROAD}.get(camera)
   if stream is None: raise KeyError(camera)
   return lambda: VisionIpcClient("camerad", stream, conflate=True)
 
@@ -178,7 +178,7 @@ def jpeg_from_frame(frame):
 
 async def live(request):
   camera = request.match_info["camera"]
-  if camera not in ("road", "driver"): raise web.HTTPNotFound()
+  if camera not in ("road", "driver", "wide_road"): raise web.HTTPNotFound()
   lease, response = request.app["lease"], None
   try:
     # Acquiring first starts camerad while offroad. Setup is retried without blocking routes.

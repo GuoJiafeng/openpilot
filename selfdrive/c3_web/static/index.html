@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>C3 设备管理</title>
-  <link rel="stylesheet" href="css/c3.css?v=1">
+  <link rel="stylesheet" href="css/c3.css?v=2">
 </head>
 <body>
   <div id="app">
@@ -94,6 +94,23 @@
                 </div>
               </div>
             </div>
+            <!-- Wide road camera -->
+            <div class="c3-cam" id="cam-wide-road">
+              <div class="c3-cam__header">
+                <span class="c3-cam__label">
+                  <span class="c3-cam__indicator" id="cam-wide-road-indicator"></span>
+                  广角道路
+                </span>
+                <span id="cam-wide-road-status" style="font-size:0.7rem;color:var(--fg-muted);font-family:var(--font-mono)"></span>
+              </div>
+              <div class="c3-cam__body">
+                <img class="c3-cam__img" id="cam-wide-road-img" alt="广角道路实时画面" src="">
+                <div class="c3-cam__placeholder" id="cam-wide-road-placeholder">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                  <span>点击「连接」开始广角道路画面</span>
+                </div>
+              </div>
+            </div>
           </div>
 
           <!-- Controls -->
@@ -125,6 +142,6 @@
   <!-- Toast container -->
   <div class="c3-toast-container" id="toast-container" aria-live="polite"></div>
 
-  <script src="js/c3.js?v=1"></script>
+  <script src="js/c3.js?v=2"></script>
 </body>
 </html>
