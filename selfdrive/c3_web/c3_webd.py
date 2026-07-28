@@ -6,6 +6,8 @@ import io
 import os
 import re
 import tempfile
+import threading
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -91,9 +93,10 @@ async def leased_live_client(lease, factory, timeout):
     lease.release()
 
 def vision_client_factory(camera):
+  streams = {"road": "VISION_STREAM_ROAD", "driver": "VISION_STREAM_DRIVER", "wide_road": "VISION_STREAM_WIDE_ROAD"}
+  if camera not in streams: raise KeyError(camera)
   from msgq.visionipc import VisionIpcClient, VisionStreamType
-  stream = {"road": VisionStreamType.VISION_STREAM_ROAD, "driver": VisionStreamType.VISION_STREAM_DRIVER, "wide_road": VisionStreamType.VISION_STREAM_WIDE_ROAD}.get(camera)
-  if stream is None: raise KeyError(camera)
+  stream = getattr(VisionStreamType, streams[camera])
   return lambda: VisionIpcClient("camerad", stream, conflate=True)
 
 class RouteStore:
@@ -165,7 +168,7 @@ class DriverViewLease:
     if self.timer: self.timer.cancel()
     self.clients = 0; self.clear()
 
-def jpeg_from_frame(frame):
+def jpeg_from_frame(frame, max_size=None):
   y = np.asarray(frame.data[:frame.uv_offset], dtype=np.uint8).reshape((-1, frame.stride))[:frame.height, :frame.width]
   uv = np.asarray(frame.data[frame.uv_offset:], dtype=np.uint8).reshape((-1, frame.stride))[:frame.height // 2, :frame.width]
   u, v = uv[:, 0::2], uv[:, 1::2]
@@ -173,27 +176,219 @@ def jpeg_from_frame(frame):
   yuv = np.dstack((y, u[:frame.height, :frame.width], v[:frame.height, :frame.width])).astype(np.int16)
   yuv[:, :, 1:] -= 128
   rgb = np.dot(yuv, np.array([[1., 1., 1.], [0., -.39465, 2.03211], [1.13983, -.58060, 0.]])).clip(0, 255).astype(np.uint8)
-  image = Image.fromarray(rgb); image.thumbnail((640, 480))
-  out = io.BytesIO(); image.save(out, "JPEG", quality=75); return out.getvalue()
+  image = Image.fromarray(rgb); image.thumbnail(max_size or live_dimensions())
+  out = io.BytesIO(); image.save(out, "JPEG", quality=70); return out.getvalue()
 
-async def live(request):
+def live_fps(value=None):
+  try: return max(1, min(20, int(value if value is not None else os.getenv("C3_WEB_FPS", "15"))))
+  except (TypeError, ValueError): return 15
+
+def live_dimensions(width=None, height=None):
+  def dimension(value, env, default, low, high):
+    try: return max(low, min(high, int(value if value is not None else os.getenv(env, default))) & ~1)
+    except (TypeError, ValueError): return default
+  return dimension(width, "C3_WEB_MAX_WIDTH", 480, 160, 640), dimension(height, "C3_WEB_MAX_HEIGHT", 360, 120, 480)
+
+class AvJpegEncoder:
+  """Per-camera MJPEG encoder. NV12 is copied line-by-line to tolerate padded planes."""
+  def __init__(self, max_size=None):
+    import av
+    self.av, self.codec, self.size, self.max_size, self.sample = av, None, None, max_size or live_dimensions(), None
+
+  def encode(self, frame):
+    width, height = frame.width, frame.height
+    scale = min(1, self.max_size[0] / width, self.max_size[1] / height)
+    size = (max(2, int(width * scale) & ~1), max(2, int(height * scale) & ~1))
+    raw = memoryview(frame.data); source_stride, uv_offset = frame.stride, frame.uv_offset
+    nv12 = self.av.VideoFrame(*size, "nv12")
+    y = np.frombuffer(raw, dtype=np.uint8, count=height * source_stride).reshape(height, source_stride)[:, :width]
+    uv = np.frombuffer(raw, dtype=np.uint8, count=(height // 2) * source_stride, offset=uv_offset).reshape(height // 2, source_stride)[:, :width].reshape(height // 2, width // 2, 2)
+    if self.sample is None or self.sample[0] != (width, height, size):
+      self.sample = ((width, height, size), np.linspace(0, height - 1, size[1], dtype=int), np.linspace(0, width - 1, size[0], dtype=int), np.linspace(0, height // 2 - 1, size[1] // 2, dtype=int), np.linspace(0, width // 2 - 1, size[0] // 2, dtype=int))
+    _, y_rows, y_cols, uv_rows, uv_cols = self.sample
+    planes = ((nv12.planes[0], y[np.ix_(y_rows, y_cols)]), (nv12.planes[1], uv[np.ix_(uv_rows, uv_cols)].reshape(size[1] // 2, size[0])))
+    for plane, pixels in planes:
+      data = bytearray(plane.buffer_size)
+      for row in range(pixels.shape[0]):
+        data[row * plane.line_size:row * plane.line_size + size[0]] = pixels[row].tobytes()
+      plane.update(bytes(data))
+    if self.codec is None or self.size != size:
+      if self.codec is not None: self.codec.close()
+      self.codec = self.av.CodecContext.create("mjpeg", "w")
+      self.codec.width, self.codec.height, self.codec.pix_fmt = *size, "yuvj420p"
+      self.codec.options = {"qscale": "5"}; self.codec.open(); self.size = size
+    packets = self.codec.encode(nv12.reformat(format="yuvj420p"))
+    if not packets: raise RuntimeError("MJPEG encoder produced no frame")
+    return bytes(packets[0])
+
+class JpegEncoder:
+  def __init__(self):
+    self.max_size = live_dimensions()
+    try: self.av = AvJpegEncoder(self.max_size)
+    except Exception: self.av = None
+
+  def encode(self, frame):
+    if self.av is not None:
+      try: return self.av.encode(frame)
+      except Exception: self.av = None
+    return jpeg_from_frame(frame, self.max_size)
+
+  def close(self):
+    if self.av and self.av.codec: self.av.codec.close()
+
+class FrameBroadcaster:
+  """One VisionIPC reader per camera; broadcasts JPEG frames to all WebSocket clients."""
+  def __init__(self, camera, fps=None, client_factory=None, encoder_factory=None):
+    self.camera, self.fps, self.client_factory = camera, live_fps(fps), client_factory
+    self.encoder_factory, self.clients, self.latest_frame, self.error = encoder_factory or JpegEncoder, set(), None, None
+    self.frames_encoded, self.frames_dropped, self.started_at = 0, 0, 0.
+    self.thread, self.stop_event, self.loop, self.generation, self.terminal = None, None, None, 0, False
+
+  def metrics(self):
+    elapsed = max(0.001, asyncio.get_running_loop().time() - self.started_at) if self.started_at else 0.
+    return {"frames": self.frames_encoded, "dropped": self.frames_dropped, "fps": round(self.frames_encoded / elapsed, 1) if elapsed else 0.}
+
+  def subscribe(self):
+    q = asyncio.Queue(maxsize=1); self.clients.add(q)
+    if self.latest_frame:
+      self._put_latest(q, self.latest_frame)
+    elif self.error:
+      self._put_latest(q, None)
+    return q
+
+  def unsubscribe(self, q): self.clients.discard(q)
+  @property
+  def has_clients(self): return bool(self.clients)
+
+  async def start(self):
+    if self.thread is None or not self.thread.is_alive():
+      self.error = None
+      self.frames_encoded, self.frames_dropped, self.terminal = 0, 0, False
+      self.started_at, self.loop, self.stop_event = asyncio.get_running_loop().time(), asyncio.get_running_loop(), threading.Event()
+      self.generation += 1
+      self.thread = threading.Thread(target=self._worker, args=(self.generation,), name=f"c3-web-{self.camera}", daemon=True)
+      self.thread.start()
+
+  @staticmethod
+  def _put_latest(q, value):
+    while q.full():
+      try: q.get_nowait()
+      except asyncio.QueueEmpty: break
+    q.put_nowait(value)
+
+  def _publish(self, value):
+    for q in list(self.clients):
+      if q.full(): self.frames_dropped += 1
+      self._put_latest(q, value)
+
+  async def stop(self):
+    thread, stop_event = self.thread, self.stop_event
+    if thread is not None:
+      stop_event.set()
+      await asyncio.to_thread(thread.join)
+      await asyncio.sleep(0)
+      if self.thread is thread: self.thread = None
+
+  def _on_frame(self, generation, jpeg):
+    if generation != self.generation or self.terminal: return
+    self.latest_frame, self.frames_encoded = jpeg, self.frames_encoded + 1
+    self._publish(jpeg)
+
+  def _on_terminal(self, generation, error):
+    if generation != self.generation or self.terminal: return
+    self.terminal, self.error = True, error
+    self._publish(None)
+
+  def _connect_worker_client(self, factory):
+    deadline = time.monotonic() + float(os.getenv("C3_WEB_CAMERA_STARTUP", "5"))
+    while not self.stop_event.is_set():
+      client = None
+      try:
+        client = factory()
+        if client.connect(False): return client
+      except Exception:
+        pass
+      if client is not None:
+        close = getattr(client, "close", None)
+        if callable(close):
+          try: close()
+          except Exception: pass
+      if time.monotonic() >= deadline: break
+      self.stop_event.wait(.1)
+    raise RuntimeError("camera unavailable")
+
+  def _worker(self, generation):
+    client = None
+    encoder = None
+    error = None
+    try:
+      factory = self.client_factory or (lambda: vision_client_factory(self.camera)())
+      client = self._connect_worker_client(factory)
+      encoder = self.encoder_factory()
+      interval = 1 / self.fps
+      next_frame = time.monotonic()
+      while not self.stop_event.is_set():
+        frame = client.recv(timeout_ms=max(50, int(interval * 1000)))
+        if frame:
+          jpeg = encoder.encode(frame)
+          if jpeg:
+            self.loop.call_soon_threadsafe(self._on_frame, generation, jpeg)
+            next_frame += interval
+            delay = next_frame - time.monotonic()
+            if delay > 0: self.stop_event.wait(delay)
+            else: next_frame = time.monotonic()
+    except Exception as exc: error = str(exc)
+    finally:
+      if encoder is not None:
+        close = getattr(encoder, "close", None)
+        if callable(close):
+          try: close()
+          except Exception: pass
+      if client:
+        close = getattr(client, "close", None)
+        if callable(close):
+          try: close()
+          except Exception: pass
+      self.loop.call_soon_threadsafe(self._on_terminal, generation, error)
+
+async def ws_sender(ws, queue, broadcaster):
+  while not ws.closed:
+    frame = await queue.get()
+    if frame is None:
+      if broadcaster.error: await ws.close(code=1011, message=b"camera unavailable")
+      return
+    await ws.send_bytes(frame)
+
+async def ws_receiver(ws):
+  async for _ in ws: pass
+
+async def ws_session(ws, queue, broadcaster):
+  sender, receiver = asyncio.create_task(ws_sender(ws, queue, broadcaster)), asyncio.create_task(ws_receiver(ws))
+  done, pending = await asyncio.wait((sender, receiver), return_when=asyncio.FIRST_COMPLETED)
+  for task in pending: task.cancel()
+  await asyncio.gather(*pending, return_exceptions=True)
+  for task in done: task.result()
+
+async def live_ws(request):
+  """WebSocket endpoint: pushes paced JPEG frames (15 FPS by default, up to 20)."""
   camera = request.match_info["camera"]
   if camera not in ("road", "driver", "wide_road"): raise web.HTTPNotFound()
-  lease, response = request.app["lease"], None
+  lease, broadcasters = request.app["lease"], request.app["broadcasters"]
+  lease.acquire(); q = bc = ws = None
   try:
-    # Acquiring first starts camerad while offroad. Setup is retried without blocking routes.
-    async with leased_live_client(lease, lambda: vision_client_factory(camera)(), float(os.getenv("C3_WEB_CAMERA_STARTUP", "5"))) as client:
-      response = web.StreamResponse(headers={"Content-Type": "multipart/x-mixed-replace; boundary=frame", "Cache-Control": "no-cache"}); await response.prepare(request)
-      while True:
-        frame = await asyncio.get_running_loop().run_in_executor(None, lambda: client.recv(timeout_ms=1000))
-        if frame:
-          data = jpeg_from_frame(frame); await response.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(len(data)).encode() + b"\r\n\r\n" + data + b"\r\n")
-        await asyncio.sleep(1 / max(1, int(os.getenv("C3_WEB_FPS", "5"))))
+    ws = web.WebSocketResponse(heartbeat=30); await ws.prepare(request)
+    if camera not in broadcasters: broadcasters[camera] = FrameBroadcaster(camera)
+    bc = broadcasters[camera]; await bc.start(); q = bc.subscribe()
+    await ws_session(ws, q, bc)
   except asyncio.CancelledError: raise
   except (ConnectionError, OSError): pass
-  except Exception as exc: raise web.HTTPServiceUnavailable(text="camera unavailable") from exc
-  assert response is not None
-  return response
+  finally:
+    if q is not None and bc is not None:
+      bc.unsubscribe(q)
+      if not bc.has_clients: await bc.stop()
+    lease.release()
+  assert ws is not None
+  return ws
 
 async def route_response(request):
   result = request.app["store"].route(request.match_info["route"])
@@ -204,7 +399,7 @@ async def health_response(request):
   return web.json_response({"ok": True})
 
 async def status_response(request):
-  return web.json_response({"ok": True, "routes": len(request.app["store"].routes())})
+  return web.json_response({"ok": True, "routes": len(request.app["store"].routes()), "live": {camera: bc.metrics() for camera, bc in request.app["broadcasters"].items()}})
 
 async def routes_response(request):
   return web.json_response(request.app["store"].routes())
@@ -245,16 +440,18 @@ def create_app(roots=None, params=None, preview_dir=None):
     from openpilot.common.params import Params
     params = Params()
   preview_dir = Path(preview_dir or Path(tempfile.gettempdir()) / "c3-web-preview"); preview_dir.mkdir(parents=True, exist_ok=True)
-  app = web.Application(); app["store"] = RouteStore(roots); app["lease"] = DriverViewLease(params, float(os.getenv("C3_WEB_DRIVER_GRACE", "2"))); app["preview_dir"] = preview_dir; app["preview_semaphore"] = asyncio.Semaphore(max(1, int(os.getenv("C3_WEB_PREVIEW_JOBS", "2"))))
+  app = web.Application(); app["store"] = RouteStore(roots); app["lease"] = DriverViewLease(params, float(os.getenv("C3_WEB_DRIVER_GRACE", "2"))); app["preview_dir"] = preview_dir; app["preview_semaphore"] = asyncio.Semaphore(max(1, int(os.getenv("C3_WEB_PREVIEW_JOBS", "2")))); app["broadcasters"] = {}
   app.router.add_get("/health", health_response)
   app.router.add_get("/api/status", status_response)
   app.router.add_get("/api/routes", routes_response); app.router.add_get("/api/routes/{route}", route_response)
-  app.router.add_get("/api/file/{route}/{segment}/{filename}", file_response); app.router.add_get("/api/preview/{route}/{segment}", preview_response); app.router.add_get("/api/live/{camera}", live)
+  app.router.add_get("/api/file/{route}/{segment}/{filename}", file_response); app.router.add_get("/api/preview/{route}/{segment}", preview_response); app.router.add_get("/api/live/{camera}/ws", live_ws)
   static = Path(__file__).parent / "static"
   if static.is_dir():
     async def index_response(request): return web.FileResponse(static / "index.html")
     app.router.add_get("/", index_response); app.router.add_static("/", static, show_index=False)
-  async def cleanup(app): app["lease"].close()
+  async def cleanup(app):
+    for bc in app.get("broadcasters", {}).values(): await bc.stop()
+    app["lease"].close()
   app.on_cleanup.append(cleanup); return app
 
 def main():

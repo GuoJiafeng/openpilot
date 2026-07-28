@@ -430,105 +430,99 @@
   }
 
   // ============================================================
-  // Live View
+  // Live View (WebSocket + binary JPEG frames)
   // ============================================================
 
-  /** The backend serves proper MJPEG multipart streams. Browsers
-      render these natively in <img> — just set src once and the
-      browser keeps the connection open. To stop: clear src. */
+  function LiveStream(camera, img, placeholder, indicator, status) {
+    this.camera = camera; this.img = img; this.placeholder = placeholder;
+    this.indicator = indicator; this.status = status;
+    this.ws = null; this.displayUrl = null; this.pendingUrl = null;
+    this.retryTimer = null; this.wanted = false; this.generation = 0;
+  }
+  LiveStream.prototype._revoke = function (name) {
+    if (this[name]) { URL.revokeObjectURL(this[name]); this[name] = null; }
+  };
+  LiveStream.prototype._scheduleReconnect = function () {
+    var self = this;
+    if (!this.wanted || document.hidden || this.retryTimer) return;
+    this.retryTimer = setTimeout(function () { self.retryTimer = null; self.connect(); }, 1000);
+  };
+  LiveStream.prototype.connect = function () {
+    this.wanted = true;
+    if (this.ws || this.retryTimer || document.hidden) return;
+    var self = this;
+    var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    var generation = ++this.generation;
+    var ws = new WebSocket(proto + '//' + location.host + '/api/live/' + this.camera + '/ws');
+    this.ws = ws; ws.binaryType = 'arraybuffer';
+    this.placeholder.style.display = 'none';
+    this.img.classList.add('c3-cam__img--visible');
+    this.indicator.classList.add('c3-cam__indicator--live');
+    this.status.textContent = '连接中';
+    this.status.style.color = 'var(--warn)';
+    ws.onmessage = function (evt) {
+      if (self.ws !== ws || generation !== self.generation) return;
+      if (typeof evt.data === 'string') { self.status.textContent = '信号丢失'; self.status.style.color = 'var(--err)'; return; }
+      self._revoke('pendingUrl');
+      var url = URL.createObjectURL(new Blob([evt.data], { type: 'image/jpeg' }));
+      self.pendingUrl = url;
+      self.img.onload = function () {
+        if (self.pendingUrl !== url) return;
+        self._revoke('displayUrl'); self.displayUrl = url; self.pendingUrl = null;
+        self.status.textContent = '接收中'; self.status.style.color = 'var(--ok)';
+      };
+      self.img.onerror = function () { if (self.pendingUrl === url) self._revoke('pendingUrl'); };
+      self.img.src = url;
+    };
+    ws.onerror = function () { if (self.ws === ws) { self.status.textContent = '信号丢失'; self.status.style.color = 'var(--err)'; } };
+    ws.onclose = function () {
+      if (self.ws !== ws) return;
+      self.ws = null;
+      if (self.wanted && !document.hidden) self._scheduleReconnect();
+    };
+  };
+  LiveStream.prototype.disconnect = function () {
+    this.wanted = false; this.generation++;
+    if (this.retryTimer) { clearTimeout(this.retryTimer); this.retryTimer = null; }
+    if (this.ws) { this.ws.close(); this.ws = null; }
+    this._revoke('pendingUrl'); this._revoke('displayUrl');
+    this.img.classList.remove('c3-cam__img--visible');
+    this.img.removeAttribute('src');
+    this.img.src = '';
+    this.placeholder.style.display = '';
+    this.indicator.classList.remove('c3-cam__indicator--live');
+    this.status.textContent = '';
+  };
+  LiveStream.prototype.pause = function () {
+    this.generation++;
+    if (this.retryTimer) { clearTimeout(this.retryTimer); this.retryTimer = null; }
+    if (this.ws) { this.ws.close(); this.ws = null; }
+    this._revoke('pendingUrl'); this._revoke('displayUrl');
+    this.img.removeAttribute('src');
+    this.status.textContent = '已暂停';
+    this.status.style.color = 'var(--fg-muted)';
+  };
+  LiveStream.prototype.resume = function () { if (this.wanted && !this.ws) this.connect(); };
+
+  var roadStream = new LiveStream('road', camRoadImg, camRoadPlaceholder, camRoadIndicator, camRoadStatus);
+  var driverStream = new LiveStream('driver', camDriverImg, camDriverPlaceholder, camDriverIndicator, camDriverStatus);
+  var wideRoadStream = new LiveStream('wide_road', camWideRoadImg, camWideRoadPlaceholder, camWideRoadIndicator, camWideRoadStatus);
+  var liveStreams = [roadStream, driverStream, wideRoadStream];
 
   function liveConnect() {
     if (state.liveConnected) return;
     state.liveConnected = true;
-
     btnConnect.disabled = true;
     btnDisconnect.disabled = false;
-
-    // Road
-    camRoadPlaceholder.style.display = 'none';
-    camRoadImg.classList.add('c3-cam__img--visible');
-    camRoadIndicator.classList.add('c3-cam__indicator--live');
-    camRoadStatus.textContent = '连接中';
-    camRoadStatus.style.color = 'var(--warn)';
-    camRoadImg.onload = function () {
-      camRoadStatus.textContent = '接收中';
-      camRoadStatus.style.color = 'var(--ok)';
-    };
-    camRoadImg.onerror = function () {
-      camRoadStatus.textContent = '信号丢失';
-      camRoadStatus.style.color = 'var(--err)';
-    };
-    camRoadImg.src = API_BASE + '/api/live/road';
-
-    // Driver
-    camDriverPlaceholder.style.display = 'none';
-    camDriverImg.classList.add('c3-cam__img--visible');
-    camDriverIndicator.classList.add('c3-cam__indicator--live');
-    camDriverStatus.textContent = '连接中';
-    camDriverStatus.style.color = 'var(--warn)';
-    camDriverImg.onload = function () {
-      camDriverStatus.textContent = '接收中';
-      camDriverStatus.style.color = 'var(--ok)';
-    };
-    camDriverImg.onerror = function () {
-      camDriverStatus.textContent = '信号丢失';
-      camDriverStatus.style.color = 'var(--err)';
-    };
-    camDriverImg.src = API_BASE + '/api/live/driver';
-
-    // Wide road
-    camWideRoadPlaceholder.style.display = 'none';
-    camWideRoadImg.classList.add('c3-cam__img--visible');
-    camWideRoadIndicator.classList.add('c3-cam__indicator--live');
-    camWideRoadStatus.textContent = '连接中';
-    camWideRoadStatus.style.color = 'var(--warn)';
-    camWideRoadImg.onload = function () {
-      camWideRoadStatus.textContent = '接收中';
-      camWideRoadStatus.style.color = 'var(--ok)';
-    };
-    camWideRoadImg.onerror = function () {
-      camWideRoadStatus.textContent = '信号丢失';
-      camWideRoadStatus.style.color = 'var(--err)';
-    };
-    camWideRoadImg.src = API_BASE + '/api/live/wide_road';
+    liveStreams.forEach(function (s) { s.connect(); });
   }
 
   function liveDisconnect() {
     if (!state.liveConnected) return;
     state.liveConnected = false;
-
     btnConnect.disabled = false;
     btnDisconnect.disabled = true;
-
-    // Road — clearing src terminates the MJPEG fetch
-    camRoadImg.onload = null;
-    camRoadImg.onerror = null;
-    camRoadImg.classList.remove('c3-cam__img--visible');
-    camRoadImg.removeAttribute('src');
-    camRoadImg.src = '';
-    camRoadPlaceholder.style.display = '';
-    camRoadIndicator.classList.remove('c3-cam__indicator--live');
-    camRoadStatus.textContent = '';
-
-    // Driver
-    camDriverImg.onload = null;
-    camDriverImg.onerror = null;
-    camDriverImg.classList.remove('c3-cam__img--visible');
-    camDriverImg.removeAttribute('src');
-    camDriverImg.src = '';
-    camDriverPlaceholder.style.display = '';
-    camDriverIndicator.classList.remove('c3-cam__indicator--live');
-    camDriverStatus.textContent = '';
-
-    // Wide road
-    camWideRoadImg.onload = null;
-    camWideRoadImg.onerror = null;
-    camWideRoadImg.classList.remove('c3-cam__img--visible');
-    camWideRoadImg.removeAttribute('src');
-    camWideRoadImg.src = '';
-    camWideRoadPlaceholder.style.display = '';
-    camWideRoadIndicator.classList.remove('c3-cam__indicator--live');
-    camWideRoadStatus.textContent = '';
+    liveStreams.forEach(function (s) { s.disconnect(); });
   }
 
   btnConnect.addEventListener('click', liveConnect);
@@ -796,18 +790,12 @@
   // Stop live streams on page unload
   window.addEventListener('beforeunload', liveDisconnect);
 
-  // Pause MJPEG when tab is hidden, resume when visible
+  // Stop WebSockets while hidden; reconnect only if the user left live view connected.
   document.addEventListener('visibilitychange', function () {
     if (document.hidden && state.liveConnected) {
-      // Clear src to stop the MJPEG fetch
-      camRoadImg.removeAttribute('src');
-      camDriverImg.removeAttribute('src');
-      camWideRoadImg.removeAttribute('src');
+      liveStreams.forEach(function (s) { s.pause(); });
     } else if (!document.hidden && state.liveConnected) {
-      // Reconnect
-      camRoadImg.src = API_BASE + '/api/live/road';
-      camDriverImg.src = API_BASE + '/api/live/driver';
-      camWideRoadImg.src = API_BASE + '/api/live/wide_road';
+      liveStreams.forEach(function (s) { s.resume(); });
     }
   });
 

@@ -1,6 +1,7 @@
 import asyncio
+import threading
 
-from openpilot.selfdrive.c3_web.c3_webd import DriverViewLease, RouteStore, connect_live_client, leased_live_client, main, preview_cache_key, route_and_segment
+from openpilot.selfdrive.c3_web.c3_webd import DriverViewLease, FrameBroadcaster, RouteStore, connect_live_client, leased_live_client, live_dimensions, live_fps, main, preview_cache_key, route_and_segment, vision_client_factory, ws_session
 
 
 class FakeParams:
@@ -70,6 +71,54 @@ def test_multiple_live_leases_keep_driver_view_enabled():
     assert params.get_bool("IsDriverViewEnabled")
     lease.release(); await asyncio.sleep(.01)
     assert not params.get_bool("IsDriverViewEnabled")
+  asyncio.run(run())
+
+
+def test_live_fps_clamp_and_invalid_camera_need_no_hardware():
+  assert live_fps("0") == 1 and live_fps("99") == 20 and live_fps("bad") == 15
+  assert live_dimensions("1", "999") == (160, 480)
+  assert live_dimensions("481", "361") == (480, 360)
+  try: vision_client_factory("nope")
+  except KeyError: pass
+  else: assert False
+
+
+def test_broadcaster_fanout_drops_stale_frames_and_cleans_up():
+  class Client:
+    def __init__(self): self.closed = False; self.threads = [threading.get_ident()]
+    def connect(self, _): self.threads.append(threading.get_ident()); return True
+    def recv(self, timeout_ms): self.threads.append(threading.get_ident()); return b"frame"
+    def close(self): self.closed = True; self.threads.append(threading.get_ident())
+  class Encoder:
+    def __init__(self): self.closed = False; self.threads = [threading.get_ident()]
+    def encode(self, frame): self.threads.append(threading.get_ident()); return b"jpeg-" + frame
+    def close(self): self.closed = True; self.threads.append(threading.get_ident())
+  async def run():
+    clients, encoders = [], []
+    def factory(): clients.append(Client()); return clients[-1]
+    def encoder_factory(): encoders.append(Encoder()); return encoders[-1]
+    bc = FrameBroadcaster("road", 20, factory, encoder_factory)
+    first, second = bc.subscribe(), bc.subscribe()
+    await bc.start()
+    assert await asyncio.wait_for(first.get(), .5) == b"jpeg-frame"
+    assert await asyncio.wait_for(second.get(), .5) == b"jpeg-frame"
+    assert len(clients) == 1 and bc.thread is not None
+    bc._publish(b"stale"); bc._publish(b"latest")
+    assert await first.get() == b"latest"
+    await bc.stop()
+    assert bc.thread is None and clients[0].closed and encoders[0].closed
+    assert len(set(clients[0].threads + encoders[0].threads)) == 1
+  asyncio.run(run())
+
+
+def test_ws_session_cancels_blocked_sender_when_peer_closes():
+  class WebSocket:
+    closed = False
+    async def send_bytes(self, frame): assert False
+    def __aiter__(self): return self
+    async def __anext__(self): raise StopAsyncIteration
+  async def run():
+    await asyncio.wait_for(ws_session(WebSocket(), asyncio.Queue(), type("Broadcaster", (), {"error": None})()), .1)
   asyncio.run(run())
 
 
