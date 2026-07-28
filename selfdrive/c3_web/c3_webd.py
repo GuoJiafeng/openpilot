@@ -207,7 +207,7 @@ def jpeg_pillow_quality(qscale=None):
 def live_preset(params):
   try:
     raw = params.get("C3WebLiveQuality")
-    index = 1 if raw is None else int(raw.decode("utf-8"))
+    index = int(raw.decode("utf-8")) if isinstance(raw, bytes) else int(raw) if raw is not None else 1
   except (AttributeError, TypeError, ValueError): index = 1
   return LIVE_PRESETS[index] if 0 <= index < len(LIVE_PRESETS) else LIVE_PRESETS[1]
 
