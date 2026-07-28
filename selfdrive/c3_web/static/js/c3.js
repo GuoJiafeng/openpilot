@@ -127,6 +127,30 @@
     return fetch(API_BASE + '/health').then(function (r) { return r.ok; }).catch(function () { return false; });
   }
 
+  function fetchLiveConfig() {
+    return fetch(API_BASE + '/api/live/config').then(function (r) {
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return r.json();
+    }).catch(function (e) { return { _error: e.message }; });
+  }
+
+  function postLiveConfig(presetId) {
+    return fetch(API_BASE + '/api/live/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ preset: presetId })
+    }).then(function (r) {
+      if (r.ok) return r.json();
+      var status = r.status;
+      return r.text().then(function (body) {
+        var e = new Error('HTTP ' + status);
+        e.status = status;
+        try { var j = JSON.parse(body); e.detail = j.error || j.message || body; } catch (_) { e.detail = body; }
+        throw e;
+      });
+    });
+  }
+
   // ============================================================
   // Toast
   // ============================================================
@@ -163,7 +187,11 @@
     selectedRoute: null,
     liveConnected: false,
     healthOk: false,
-    expandedSegments: {}
+    expandedSegments: {},
+    // Quality selector
+    qualityOptions: [],
+    qualitySelected: null,
+    qualityApplying: false
   };
 
   // ============================================================
@@ -195,6 +223,9 @@
   var btnConnect = $id('btn-live-connect');
   var btnDisconnect = $id('btn-live-disconnect');
 
+  var qualitySelector = $id('quality-selector');
+  var qualityOptions = $id('quality-options');
+
   // ============================================================
   // Navigation
   // ============================================================
@@ -221,6 +252,7 @@
     // Lazy-load
     if (name === 'home') loadStatus();
     if (name === 'routes' && !state.selectedRoute) loadRoutes();
+    if (name === 'live') loadQualityConfig();
   }
 
   navTabs.forEach(function (tab) {
@@ -527,6 +559,153 @@
 
   btnConnect.addEventListener('click', liveConnect);
   btnDisconnect.addEventListener('click', liveDisconnect);
+
+  // ============================================================
+  // Quality Selector
+  // ============================================================
+
+  /** Build the sub-label for a quality option, e.g. "960 · 约9 FPS" */
+  function qualityDetailText(opt) {
+    var parts = [];
+    var w = get(opt, 'width', null);
+    if (w != null && !isNaN(w)) parts.push(String(Math.round(Number(w))));
+    var fps = get(opt, 'estimatedFps', null) || get(opt, 'estimated_fps', null);
+    if (fps != null && !isNaN(fps)) parts.push('约' + Math.round(Number(fps)) + ' FPS');
+    return parts.length ? parts.join(' · ') : '';
+  }
+
+  /** Render quality selector buttons from state */
+  function renderQualitySelector() {
+    var opts = state.qualityOptions;
+    if (!opts || !opts.length) {
+      qualityOptions.innerHTML = '<span style="font-size:0.7rem;color:var(--fg-muted);padding:var(--s1) var(--s2)">加载中…</span>';
+      return;
+    }
+
+    var html = '';
+    opts.forEach(function (opt) {
+      var id = get(opt, 'id', '');
+      var label = get(opt, 'label', id);
+      var detail = qualityDetailText(opt);
+      var isActive = id === state.qualitySelected;
+      var isApplying = state.qualityApplying;
+
+      html += '<button type="button" class="c3-quality__btn' +
+        (isActive ? ' c3-quality__btn--active' : '') +
+        (isApplying ? ' c3-quality__btn--applying' : '') +
+        '" data-quality-id="' + esc(id) + '"' +
+        ' role="radio" aria-checked="' + (isActive ? 'true' : 'false') + '"' +
+        (isApplying ? ' disabled' : '') +
+        ' title="' + esc(label) + (detail ? ' (' + detail + ')' : '') + '">' +
+        '<span class="c3-quality__name">' + esc(label) + '</span>' +
+        (detail ? '<span class="c3-quality__detail">' + esc(detail) + '</span>' : '') +
+      '</button>';
+    });
+
+    qualityOptions.innerHTML = html;
+
+    // Bind click handlers
+    qualityOptions.querySelectorAll('.c3-quality__btn').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        var id = btn.getAttribute('data-quality-id');
+        if (id && id !== state.qualitySelected && !state.qualityApplying) {
+          applyQualityChange(id);
+        }
+      });
+    });
+  }
+
+  /** Load quality config from backend (does NOT auto-connect cameras) */
+  function loadQualityConfig() {
+    fetchLiveConfig().then(function (data) {
+      if (data && data._error) {
+        qualityOptions.innerHTML = '<span style="font-size:0.7rem;color:var(--fg-muted);padding:var(--s1) var(--s2)">不可用</span>';
+        return;
+      }
+      var opts = get(data, 'options', []);
+      if (!Array.isArray(opts)) opts = [];
+      state.qualityOptions = opts;
+      state.qualitySelected = get(data, 'selected', null);
+      renderQualitySelector();
+    });
+  }
+
+  /**
+   * Apply a quality preset change:
+   * 1. Remember whether streams were connected
+   * 2. Disconnect all streams
+   * 3. POST the new preset
+   * 4. On success: update selected, reconnect if was connected
+   * 5. On 409: wait briefly for disconnect to settle, retry once
+   * 6. On other error: toast, restore prior selection
+   */
+  function applyQualityChange(newId, isRetry) {
+    var wasConnected = state.liveConnected;
+    var previousId = state.qualitySelected;
+
+    // Step 1: Disconnect if connected
+    if (wasConnected) {
+      liveDisconnect();
+    }
+
+    // Step 2: Mark as applying, update UI
+    state.qualityApplying = true;
+    state.qualitySelected = newId;  // optimistically show new selection
+    renderQualitySelector();
+    btnConnect.disabled = true;
+    btnDisconnect.disabled = true;
+
+    // Step 3: POST after a brief settle (even if not connected, to be safe)
+    var settleDelay = wasConnected ? 300 : 0;
+
+    setTimeout(function () {
+      postLiveConfig(newId).then(function (data) {
+        // Success
+        state.qualityApplying = false;
+        state.qualitySelected = get(data, 'selected', newId);
+        renderQualitySelector();
+        btnConnect.disabled = false;
+
+        // Reconnect if was connected
+        if (wasConnected) {
+          liveConnect();
+        }
+        toast('画质已切换为 ' + esc(qualityLabelForId(newId)), 'ok');
+      }).catch(function (e) {
+        var status = e.status || 0;
+
+        if (status === 409 && !isRetry) {
+          // 409: live clients still connected — wait longer and retry once
+          setTimeout(function () {
+            applyQualityChange(newId, true);
+          }, 800);
+          return;
+        }
+
+        // Failure: restore previous selection
+        state.qualityApplying = false;
+        state.qualitySelected = previousId;
+        renderQualitySelector();
+        btnConnect.disabled = false;
+
+        var msg = e.detail || e.message || '切换失败';
+        toast('画质切换失败: ' + msg, 'err');
+
+        // Reconnect with old quality if was connected
+        if (wasConnected) {
+          liveConnect();
+        }
+      });
+    }, settleDelay);
+  }
+
+  /** Get human label for a quality id */
+  function qualityLabelForId(id) {
+    for (var i = 0; i < state.qualityOptions.length; i++) {
+      if (get(state.qualityOptions[i], 'id', '') === id) return get(state.qualityOptions[i], 'label', id);
+    }
+    return id;
+  }
 
   // ============================================================
   // Routes View

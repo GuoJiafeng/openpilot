@@ -168,7 +168,7 @@ class DriverViewLease:
     if self.timer: self.timer.cancel()
     self.clients = 0; self.clear()
 
-def jpeg_from_frame(frame, max_size=None):
+def jpeg_from_frame(frame, max_size=None, quality=None):
   y = np.asarray(frame.data[:frame.uv_offset], dtype=np.uint8).reshape((-1, frame.stride))[:frame.height, :frame.width]
   uv = np.asarray(frame.data[frame.uv_offset:], dtype=np.uint8).reshape((-1, frame.stride))[:frame.height // 2, :frame.width]
   u, v = uv[:, 0::2], uv[:, 1::2]
@@ -177,23 +177,54 @@ def jpeg_from_frame(frame, max_size=None):
   yuv[:, :, 1:] -= 128
   rgb = np.dot(yuv, np.array([[1., 1., 1.], [0., -.39465, 2.03211], [1.13983, -.58060, 0.]])).clip(0, 255).astype(np.uint8)
   image = Image.fromarray(rgb); image.thumbnail(max_size or live_dimensions())
-  out = io.BytesIO(); image.save(out, "JPEG", quality=70); return out.getvalue()
+  out = io.BytesIO(); image.save(out, "JPEG", quality=quality or jpeg_pillow_quality()); return out.getvalue()
 
 def live_fps(value=None):
   try: return max(1, min(20, int(value if value is not None else os.getenv("C3_WEB_FPS", "15"))))
   except (TypeError, ValueError): return 15
 
+LIVE_PRESETS = (
+  {"preset": "smooth", "label": "流畅", "width": 640, "height": 480, "qscale": 3, "estimatedFps": 11},
+  {"preset": "high", "label": "高清", "width": 960, "height": 720, "qscale": 2, "estimatedFps": 9},
+  {"preset": "ultra", "label": "超清", "width": 1280, "height": 960, "qscale": 2, "estimatedFps": 5},
+)
+
 def live_dimensions(width=None, height=None):
   def dimension(value, env, default, low, high):
     try: return max(low, min(high, int(value if value is not None else os.getenv(env, default))) & ~1)
     except (TypeError, ValueError): return default
-  return dimension(width, "C3_WEB_MAX_WIDTH", 480, 160, 640), dimension(height, "C3_WEB_MAX_HEIGHT", 360, 120, 480)
+  return dimension(width, "C3_WEB_MAX_WIDTH", 960, 160, 1280), dimension(height, "C3_WEB_MAX_HEIGHT", 720, 120, 960)
+
+def jpeg_qscale(value=None):
+  """FFmpeg MJPEG quantizer: 2 is high quality; 15 is lowest supported quality."""
+  try: return max(2, min(15, int(value if value is not None else os.getenv("C3_WEB_JPEG_QSCALE", "2"))))
+  except (TypeError, ValueError): return 2
+
+def jpeg_pillow_quality(qscale=None):
+  """Approximate FFmpeg qscale for Pillow: qscale 2→90, qscale 5→75."""
+  return max(25, min(95, 100 - 5 * jpeg_qscale(qscale)))
+
+def live_preset(params):
+  try: index = int(params.get_int("C3WebLiveQuality"))
+  except (AttributeError, TypeError, ValueError): index = 1
+  return LIVE_PRESETS[index] if 0 <= index < len(LIVE_PRESETS) else LIVE_PRESETS[1]
+
+def live_config(params=None):
+  preset = live_preset(params) if params is not None else LIVE_PRESETS[1]
+  width = None if "C3_WEB_MAX_WIDTH" in os.environ else preset["width"]
+  height = None if "C3_WEB_MAX_HEIGHT" in os.environ else preset["height"]
+  qscale = None if "C3_WEB_JPEG_QSCALE" in os.environ else preset["qscale"]
+  width, height = live_dimensions(width, height)
+  return {"selected": preset["preset"], "width": width, "height": height, "qscale": jpeg_qscale(qscale)}
+
+def live_config_response(params):
+  return {"selected": live_config(params)["selected"], "options": [dict(option) for option in LIVE_PRESETS]}
 
 class AvJpegEncoder:
   """Per-camera MJPEG encoder. NV12 is copied line-by-line to tolerate padded planes."""
-  def __init__(self, max_size=None):
+  def __init__(self, max_size=None, qscale=None):
     import av
-    self.av, self.codec, self.size, self.max_size, self.sample = av, None, None, max_size or live_dimensions(), None
+    self.av, self.codec, self.size, self.max_size, self.qscale, self.sample = av, None, None, max_size or live_dimensions(), jpeg_qscale(qscale), None
 
   def encode(self, frame):
     width, height = frame.width, frame.height
@@ -216,22 +247,29 @@ class AvJpegEncoder:
       if self.codec is not None: self.codec.close()
       self.codec = self.av.CodecContext.create("mjpeg", "w")
       self.codec.width, self.codec.height, self.codec.pix_fmt = *size, "yuvj420p"
-      self.codec.options = {"qscale": "5"}; self.codec.open(); self.size = size
-    packets = self.codec.encode(nv12.reformat(format="yuvj420p"))
+      self.codec.options = {"qscale": str(self.qscale)}
+      try: self.codec.global_quality = self.qscale * 118 # FF_QP2LAMBDA; honored by FFmpeg's MJPEG encoder.
+      except (AttributeError, TypeError): pass
+      self.codec.open(); self.size = size
+    encoded = nv12.reformat(format="yuvj420p")
+    try: encoded.quality = self.qscale * 118
+    except (AttributeError, TypeError): pass
+    packets = self.codec.encode(encoded)
     if not packets: raise RuntimeError("MJPEG encoder produced no frame")
     return bytes(packets[0])
 
 class JpegEncoder:
-  def __init__(self):
-    self.max_size = live_dimensions()
-    try: self.av = AvJpegEncoder(self.max_size)
+  def __init__(self, config=None):
+    config = config or live_config()
+    self.max_size, self.qscale = (config["width"], config["height"]), config["qscale"]
+    try: self.av = AvJpegEncoder(self.max_size, self.qscale)
     except Exception: self.av = None
 
   def encode(self, frame):
     if self.av is not None:
       try: return self.av.encode(frame)
       except Exception: self.av = None
-    return jpeg_from_frame(frame, self.max_size)
+    return jpeg_from_frame(frame, self.max_size, jpeg_pillow_quality(self.qscale))
 
   def close(self):
     if self.av and self.av.codec: self.av.codec.close()
@@ -377,7 +415,7 @@ async def live_ws(request):
   lease.acquire(); q = bc = ws = None
   try:
     ws = web.WebSocketResponse(heartbeat=30); await ws.prepare(request)
-    if camera not in broadcasters: broadcasters[camera] = FrameBroadcaster(camera)
+    if camera not in broadcasters: broadcasters[camera] = FrameBroadcaster(camera, encoder_factory=request.app["encoder_factory"])
     bc = broadcasters[camera]; await bc.start(); q = bc.subscribe()
     await ws_session(ws, q, bc)
   except asyncio.CancelledError: raise
@@ -399,7 +437,19 @@ async def health_response(request):
   return web.json_response({"ok": True})
 
 async def status_response(request):
-  return web.json_response({"ok": True, "routes": len(request.app["store"].routes()), "live": {camera: bc.metrics() for camera, bc in request.app["broadcasters"].items()}})
+  return web.json_response({"ok": True, "routes": len(request.app["store"].routes()), "live": {camera: bc.metrics() for camera, bc in request.app["broadcasters"].items()}, "liveConfig": live_config(request.app["params"])})
+
+async def live_config_get(request):
+  return web.json_response(live_config_response(request.app["params"]))
+
+async def live_config_post(request):
+  try: preset = (await request.json()).get("preset")
+  except (ValueError, AttributeError): raise web.HTTPBadRequest(text="invalid preset")
+  options = {option["preset"]: index for index, option in enumerate(LIVE_PRESETS)}
+  if preset not in options: raise web.HTTPBadRequest(text="invalid preset")
+  if any(bc.has_clients for bc in request.app["broadcasters"].values()): raise web.HTTPConflict(text="disconnect live streams first")
+  request.app["params"].put_int("C3WebLiveQuality", options[preset])
+  return web.json_response(live_config_response(request.app["params"]))
 
 async def routes_response(request):
   return web.json_response(request.app["store"].routes())
@@ -440,9 +490,10 @@ def create_app(roots=None, params=None, preview_dir=None):
     from openpilot.common.params import Params
     params = Params()
   preview_dir = Path(preview_dir or Path(tempfile.gettempdir()) / "c3-web-preview"); preview_dir.mkdir(parents=True, exist_ok=True)
-  app = web.Application(); app["store"] = RouteStore(roots); app["lease"] = DriverViewLease(params, float(os.getenv("C3_WEB_DRIVER_GRACE", "2"))); app["preview_dir"] = preview_dir; app["preview_semaphore"] = asyncio.Semaphore(max(1, int(os.getenv("C3_WEB_PREVIEW_JOBS", "2")))); app["broadcasters"] = {}
+  app = web.Application(); app["store"] = RouteStore(roots); app["params"] = params; app["lease"] = DriverViewLease(params, float(os.getenv("C3_WEB_DRIVER_GRACE", "2"))); app["preview_dir"] = preview_dir; app["preview_semaphore"] = asyncio.Semaphore(max(1, int(os.getenv("C3_WEB_PREVIEW_JOBS", "2")))); app["broadcasters"] = {}; app["encoder_factory"] = lambda: JpegEncoder(live_config(params))
   app.router.add_get("/health", health_response)
   app.router.add_get("/api/status", status_response)
+  app.router.add_get("/api/live/config", live_config_get); app.router.add_post("/api/live/config", live_config_post)
   app.router.add_get("/api/routes", routes_response); app.router.add_get("/api/routes/{route}", route_response)
   app.router.add_get("/api/file/{route}/{segment}/{filename}", file_response); app.router.add_get("/api/preview/{route}/{segment}", preview_response); app.router.add_get("/api/live/{camera}/ws", live_ws)
   static = Path(__file__).parent / "static"

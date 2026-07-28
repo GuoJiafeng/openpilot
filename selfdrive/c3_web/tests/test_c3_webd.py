@@ -1,13 +1,18 @@
 import asyncio
+import os
 import threading
 
-from openpilot.selfdrive.c3_web.c3_webd import DriverViewLease, FrameBroadcaster, RouteStore, connect_live_client, leased_live_client, live_dimensions, live_fps, main, preview_cache_key, route_and_segment, vision_client_factory, ws_session
+from aiohttp import web
+
+from openpilot.selfdrive.c3_web.c3_webd import DriverViewLease, FrameBroadcaster, JpegEncoder, RouteStore, connect_live_client, jpeg_pillow_quality, jpeg_qscale, leased_live_client, live_config, live_config_get, live_config_post, live_config_response, live_dimensions, live_fps, main, preview_cache_key, route_and_segment, vision_client_factory, ws_session
 
 
 class FakeParams:
-  def __init__(self, offroad=True, driver=False): self.values = {"IsOffroad": offroad, "IsDriverViewEnabled": driver}
+  def __init__(self, offroad=True, driver=False): self.values = {"IsOffroad": offroad, "IsDriverViewEnabled": driver, "C3WebLiveQuality": 1}
   def get_bool(self, key): return self.values.get(key, False)
   def put_bool(self, key, value): self.values[key] = value
+  def get_int(self, key): return self.values.get(key, 0)
+  def put_int(self, key, value): self.values[key] = value
 
 
 def test_route_listing_and_final_segment_split(tmp_path):
@@ -76,11 +81,56 @@ def test_multiple_live_leases_keep_driver_view_enabled():
 
 def test_live_fps_clamp_and_invalid_camera_need_no_hardware():
   assert live_fps("0") == 1 and live_fps("99") == 20 and live_fps("bad") == 15
-  assert live_dimensions("1", "999") == (160, 480)
+  assert live_dimensions("1", "999") == (160, 960)
   assert live_dimensions("481", "361") == (480, 360)
+  assert live_dimensions("1281", "961") == (1280, 960)
+  assert live_dimensions("961", "721") == (960, 720)
+  assert live_dimensions() == (960, 720)
+  assert jpeg_qscale("1") == 2 and jpeg_qscale("99") == 15 and jpeg_qscale("bad") == 2
+  assert jpeg_pillow_quality(2) == 90 and jpeg_pillow_quality(5) == 75
+  assert live_config(FakeParams()) == {"selected": "high", "width": 960, "height": 720, "qscale": 2}
   try: vision_client_factory("nope")
   except KeyError: pass
   else: assert False
+
+
+def test_live_quality_presets_persist_and_env_overrides():
+  params = FakeParams()
+  response = live_config_response(params)
+  assert response["selected"] == "high" and [option["preset"] for option in response["options"]] == ["smooth", "high", "ultra"]
+  params.put_int("C3WebLiveQuality", 0)
+  assert live_config(params) == {"selected": "smooth", "width": 640, "height": 480, "qscale": 3}
+  smooth_encoder = JpegEncoder(live_config(params))
+  params.put_int("C3WebLiveQuality", 2)
+  ultra_encoder = JpegEncoder(live_config(params))
+  assert smooth_encoder.max_size == (640, 480) and ultra_encoder.max_size == (1280, 960)
+  old = {key: os.environ.get(key) for key in ("C3_WEB_MAX_WIDTH", "C3_WEB_MAX_HEIGHT", "C3_WEB_JPEG_QSCALE")}
+  try:
+    os.environ.update({"C3_WEB_MAX_WIDTH": "480", "C3_WEB_MAX_HEIGHT": "360", "C3_WEB_JPEG_QSCALE": "4"})
+    assert live_config(params) == {"selected": "ultra", "width": 480, "height": 360, "qscale": 4}
+  finally:
+    for key, value in old.items():
+      if value is None: os.environ.pop(key, None)
+      else: os.environ[key] = value
+
+
+def test_live_quality_post_rejects_active_and_persists_selection():
+  class Request:
+    def __init__(self, app, preset): self.app, self.preset = app, preset
+    async def json(self): return {"preset": self.preset}
+  async def run():
+    params = FakeParams(); app = {"params": params, "broadcasters": {}}
+    assert b'"selected": "high"' in (await live_config_get(type("Request", (), {"app": app})())).body
+    response = await live_config_post(Request(app, "smooth"))
+    assert params.get_int("C3WebLiveQuality") == 0 and b'"selected": "smooth"' in response.body
+    app["broadcasters"] = {"road": type("Broadcaster", (), {"has_clients": True})()}
+    try: await live_config_post(Request(app, "ultra"))
+    except web.HTTPConflict: pass
+    else: assert False
+    try: await live_config_post(Request(app, "invalid"))
+    except web.HTTPBadRequest: pass
+    else: assert False
+  asyncio.run(run())
 
 
 def test_broadcaster_fanout_drops_stale_frames_and_cleans_up():
