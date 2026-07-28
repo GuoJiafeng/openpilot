@@ -513,9 +513,10 @@ def create_app(roots=None, params=None, preview_dir=None):
     try: body = await request.json()
     except Exception: return web.json_response({"error": "invalid"}, status=400)
     pin = body.get("pin", "")
-    try: correct = params.get("C3WebPin"); correct = correct.decode("utf-8") if isinstance(correct, bytes) else correct
-    except Exception: correct = "0909"
-    if not correct or str(pin) != str(correct):
+    correct = params.get("C3WebPin")
+    if correct is None: correct = "0909"
+    elif isinstance(correct, bytes): correct = correct.decode("utf-8")
+    if str(pin) != str(correct):
       return web.json_response({"error": "wrong pin"}, status=401)
     token = secrets.token_hex(32); expiry = time.time() + 86400  # 24h
     request.app["sessions"][token] = expiry
