@@ -16,6 +16,10 @@ def kill_existing():
   except Exception: pass
 
 def main():
+  # Ensure frpc is executable regardless of git permissions
+  if not os.access(FRPC_BIN, os.X_OK):
+    FRPC_BIN.chmod(FRPC_BIN.stat().st_mode | 0o111)
+
   kill_existing()
   cmd = [str(FRPC_BIN), "-c", str(FRPC_CFG)]
   while True:
